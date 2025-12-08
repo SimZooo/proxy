@@ -1,0 +1,15 @@
+[ req ]
+distinguished_name = dn
+x509_extensions = ca_ext
+prompt = no
+
+[ dn ]
+CN = Snare CA
+O = Snare
+C = NO
+
+[ ca_ext ]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
