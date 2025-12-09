@@ -1,27 +1,121 @@
-use std::{error::Error, io, net::SocketAddr, process::exit, sync::Arc};
+use std::{error::Error, io, process::exit, sync::Arc};
 
 use hyper::{HeaderMap, header::{HeaderName, HeaderValue}};
 use rcgen::{Issuer, KeyPair};
-use reqwest::Client;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt, split}, net::{TcpListener, TcpStream}, sync::mpsc::Sender};
-use tokio_rustls::TlsAcceptor;
+use reqwest::{Client, Response};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::mpsc::Sender};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use uuid::Uuid;
 
 use crate::network::{create_server_config, generate_cert, get_domain, load_ca, read_request};
 mod network;
 
-pub struct FlowRequest {
-    pub raw: String,
+fn parse_request(raw: String, id: String) -> io::Result<FlowRequest> {
+    let mut lines = raw.split("\r\n");
+    let Some(status_line) = lines.next() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Malformed request")))
+    };
+
+    let mut status_line_split = status_line.split_whitespace();
+    let Some(method) = status_line_split.next() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Malformed request when parsing method")))
+    };
+
+    let Some(path) = status_line_split.next() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Malformed request when parsing path")))
+    };
+
+    let mut raw_split = raw.split("\r\n\r\n");
+    let Some(headers) = raw_split.next() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Malformed request when parsing headers")))
+    };
+    let Some(body) = raw_split.next() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Malformed request when parsing body")))
+    };
+
+    let host = headers.split("\r\n").find(|line| line.to_lowercase().starts_with("host")).unwrap_or("").split(":").skip(1).next().unwrap_or("");
+
+    Ok(FlowRequest::new(id.to_string(), method.to_string(), path.to_string(), host.to_string(), headers.to_string(), body.to_string(), raw.to_string()))
 }
 
-pub struct FlowResponse {
-    pub raw: String,
+async fn parse_response(res: Response, id: String) -> io::Result<FlowResponse> {
+    let status = res.status().to_string();
+    let headers = res.headers()
+    .iter()
+    .map(|(k, v)| {
+        (
+            k.to_string(),
+            v.to_str().unwrap_or("<invalid utf8>").to_string(),
+        )
+    })
+    .collect::<Vec<(String, String)>>();
+    let body = res.text().await.map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, 
+            format!("Failed parsing body: {e}"))
+    })?;
+
+    let status_line = format!("HTTP/1.1 {status}\r\n");
+
+    let mut headers_raw = headers.iter().map(|(k, v)| {
+        if !v.starts_with("transfer-encoding") {
+            let v = v.to_string();
+            format!("{k}: {v}\r\n")
+        } else {
+            String::new()
+        }
+    }).collect::<Vec<String>>();
+    if !headers.iter().any(|(k, _)| k.to_lowercase() == "content-length") {
+        println!("NO CONTENT-LENGTH");
+        headers_raw.push(format!("content-length: {}", body.bytes().len().to_string()));
+    }
+    println!("{:?}", headers_raw);
+
+    let raw = vec![status_line, headers_raw.join(""), "\r\n".to_string(), body.clone()].join("");
+
+    Ok(FlowResponse::new(id.to_string(), status.to_string(), headers, body.to_string(), raw))
 }
 
 #[derive(Debug)]
-pub struct Flow {
-    pub id: String,
-    // TODO: implement requests and responses
+pub struct FlowRequest {
+    id: String,
+    method: String,
+    path: String,
+    host: String,
+    headers: String,
+    body: String,
+    raw: String
+}
+
+impl FlowRequest {
+    fn new(id: String, method: String, path: String, host: String, headers: String, body: String, raw: String) -> Self {
+        FlowRequest { id, method, path, host, headers, body, raw }
+    }
+}
+
+#[derive(Debug)]
+pub struct FlowResponse {
+    id: String,
+    status: String,
+    headers: Vec<(String, String)>,
+    body: String,
+    raw: String,
+}
+
+impl FlowResponse {
+    fn new(id: String, status: String, headers: Vec<(String, String)>, body: String, raw: String) -> Self {
+        FlowResponse { id, status, headers, body, raw }
+    }
+}
+
+#[derive(Debug)]
+enum Flow {
+    Request(FlowRequest),
+    Response(FlowResponse),
 }
 
 #[tokio::main]
@@ -37,12 +131,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     tokio::spawn(async move {
         loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok((stream, _)) = listener.accept().await {
                 let issuer = issuer.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let body = handle_client_connection(&mut stream, issuer, tx).await?;
-                    forward_to_client(body).await;
+                    // Receive from client
+                    let (req_raw, mut tls_stream) = handle_client_connection(stream, issuer, tx.clone()).await?;
+                    let id = Uuid::new_v4().to_string();
+                    let _ = tx.send(Flow::Request(parse_request(req_raw.clone(), id.clone())?)).await;
+                    // Send to and receive from server
+                    let res = forward_to_client(req_raw).await?;
+                    let flow_res = Flow::Response(parse_response(res, id).await?);
+                    // Send response back to client
+                    if let Flow::Response(res) = &flow_res {
+                        let _ = tls_stream.write_all(res.raw.as_bytes()).await;
+                        let _ = tls_stream.flush().await;
+                    }
+
+                    let _ = tx.send(flow_res).await;
+
                     Ok(()) as io::Result<()>
                 });
             }
@@ -50,7 +157,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     });
 
     while let Some(flow) = rx.recv().await {
-        println!("Received flow: {:?}", flow);
+        //println!("Received flow: {:?}", flow);
         flows.push(flow);
         println!("Total flows: {}", flows.len());
     }
@@ -58,8 +165,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     Ok(())
 }
 
-async fn handle_client_connection(stream: &mut TcpStream, issuer: Arc<Issuer<'static, KeyPair>>, tx: Sender<Flow>) -> io::Result<String> {
-    let req = read_request(stream).await?;
+async fn handle_client_connection(mut stream: TcpStream, issuer: Arc<Issuer<'static, KeyPair>>, tx: Sender<Flow>) -> io::Result<(String, TlsStream<TcpStream>)> {
+    let req = read_request(&mut stream).await?;
     if !req.starts_with("CONNECT") {
         return Err(io::Error::new(io::ErrorKind::Other, "Expected CONNECT"));
     }
@@ -68,7 +175,6 @@ async fn handle_client_connection(stream: &mut TcpStream, issuer: Arc<Issuer<'st
     let domain_line = get_domain(&req)?;
     let domain_line = domain_line.split(":").collect::<Vec<&str>>();
     let domain = domain_line[0];
-    let port = domain_line[1];
     let (cert, key) = generate_cert(domain.to_string(), issuer).await?;
     stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -78,9 +184,6 @@ async fn handle_client_connection(stream: &mut TcpStream, issuer: Arc<Issuer<'st
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let mut tls_stream = tls_acceptor.accept(stream).await?;
-    let _ = tx.send(Flow {
-        id: Uuid::new_v4().to_string()
-    }).await;
 
     loop {
         let mut buf = vec![0u8; 4096];
@@ -88,14 +191,14 @@ async fn handle_client_connection(stream: &mut TcpStream, issuer: Arc<Issuer<'st
         if n == 0 {
             break;
         }
-        let out = String::from_utf8_lossy(&buf[..n]);
-        return Ok(out.to_string())
+        let raw = String::from_utf8_lossy(&buf[..n]);
+        return Ok((raw.to_string(), tls_stream))
     }
 
-    Ok("".to_string())
+    Err(io::Error::new(io::ErrorKind::Other, "No valid response received"))
 }
 
-async fn forward_to_client(raw: String) {
+async fn forward_to_client(raw: String) -> io::Result<Response> {
     let client = Client::new();
     let raw_owned = raw.clone();
 
@@ -113,8 +216,8 @@ async fn forward_to_client(raw: String) {
             match request_line.split_whitespace().collect::<Vec<&str>>()[..] {
                 [m, p, v] => (m, p, v),
                 _ => {
-                    eprintln!("Invalid request line: {}", request_line);
-                    return;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                        format!("Malformed request line")))
                 }
             };
 
@@ -140,12 +243,15 @@ async fn forward_to_client(raw: String) {
             None => path.to_string(),
         };
 
-        println!("Sending to {:?} {}", method, url);
+        println!("Sending {:?} to {}", method, url);
 
         let mut req = match method {
             "GET" => client.get(url.clone()),
             "POST" => client.post(url.clone()),
-            _ => return,
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                    format!("Invalid request method")))
+            },
         };
 
         req = req.headers(headers);
@@ -154,10 +260,15 @@ async fn forward_to_client(raw: String) {
             req = req.body(body.to_string());
         }
 
-        let res = req.send().await;
+        let res = req.send().await.map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, 
+                format!("Failed sending request to server: {}", e))
+        })?;
 
-        if let Ok(res) = res {
-            println!("{:?}", res.text().await);
-        }
+        return Ok(res)
+
     }
+
+    Err(io::Error::new(io::ErrorKind::InvalidData, 
+        format!("Malformed request in forward_to_client")))
 }

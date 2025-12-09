@@ -1,5 +1,5 @@
 use std::{fs::read_to_string, io, sync::Arc};
-use rcgen::{BasicConstraints, Certificate, CertificateParams, CertificateSigningRequest, DnType, IsCa, Issuer, KeyPair, PublicKey, SigningKey};
+use rcgen::{Certificate, CertificateParams, CertificateSigningRequest, DnType, IsCa, Issuer, KeyPair, PublicKey, SigningKey};
 use tokio::{io::AsyncReadExt, net::TcpStream};
 use tokio_rustls::rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::{PemObject, SectionKind}}};
 
