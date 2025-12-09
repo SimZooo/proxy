@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 hyper = "1.8.1"
 rcgen = { version = "0.14.5", features = ["pem", "x509-parser"] }
+reqwest = "0.12.25"
 tls-parser = "0.12.2"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-rustls = "0.26.4"
+uuid = { version = "1.19.0", features = ["v4"] }
 webpki-roots = "1.0.4"
